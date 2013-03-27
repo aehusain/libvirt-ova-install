@@ -1,0 +1,77 @@
+diff --git a/tools/virsh-domain.c b/tools/virsh-domain.c
+index f3da1d5..5218d12 100644
+--- a/tools/virsh-domain.c
++++ b/tools/virsh-domain.c
+@@ -5594,11 +5594,25 @@ static const vshCmdInfo info_define[] = {
+     {NULL, NULL}
+ };
+ 
++static const vshCmdInfo info_define_ova[] = {
++    {"help", N_("define (but don't start) a domain from an OVA package")},
++    {"desc", N_("Define a domain.")},
++    {NULL, NULL}
++};
++
+ static const vshCmdOptDef opts_define[] = {
+     {"file", VSH_OT_DATA, VSH_OFLAG_REQ, N_("file containing an XML domain description")},
+     {NULL, 0, 0, NULL}
+ };
+ 
++static const vshCmdOptDef opts_define_ova[] = {
++    {"file", VSH_OT_DATA, VSH_OFLAG_REQ,
++        N_("ova package file")},
++    {"pool", VSH_OT_STRING, VSH_OFLAG_REQ_OPT,
++        N_("storage pool to define new domain")},
++    {NULL, 0, 0, NULL}
++};
++
+ static bool
+ cmdDefine(vshControl *ctl, const vshCmd *cmd)
+ {
+@@ -5627,6 +5641,35 @@ cmdDefine(vshControl *ctl, const vshCmd *cmd)
+     return ret;
+ }
+ 
++static bool
++cmdDefineOVA(vshControl *ctl, const vshCmd *cmd)
++{
++    virDomainPtr dom;
++    const char *file = NULL;
++    const char *pool = NULL;
++    bool ret = true;
++
++    if (vshCommandOptString(cmd, "file", &file) <= 0)
++        return false;
++
++    if (vshCommandOptString(cmd, "pool", &pool) <= 0)
++        return false;
++
++    dom = virDomainDefineOVA(ctl->conn, file, pool);
++    VIR_FREE(file);
++    VIR_FREE(pool);
++
++    if (dom != NULL) {
++        vshPrint(ctl, _("Domain %s defined from %s\n"),
++                 virDomainGetName(dom), file);
++        virDomainFree(dom);
++    } else {
++        vshError(ctl, _("Failed to define domain from %s"), file);
++        ret = false;
++    }
++    return ret;
++}
++
+ /*
+  * "destroy" command
+  */
+@@ -8515,6 +8558,7 @@ const vshCmdDef domManagementCmds[] = {
+     {"cpu-stats", cmdCPUStats, opts_cpu_stats, info_cpu_stats, 0},
+     {"create", cmdCreate, opts_create, info_create, 0},
+     {"define", cmdDefine, opts_define, info_define, 0},
++    {"define-ova", cmdDefineOVA, opts_define_ova, info_define_ova, 0},
+     {"desc", cmdDesc, opts_desc, info_desc, 0},
+     {"destroy", cmdDestroy, opts_destroy, info_destroy, 0},
+     {"detach-device", cmdDetachDevice, opts_detach_device,
+-- 
+1.7.9.5
+
