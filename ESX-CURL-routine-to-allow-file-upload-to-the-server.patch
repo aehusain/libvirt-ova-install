@@ -1,0 +1,280 @@
+diff --git a/src/esx/esx_vi.c b/src/esx/esx_vi.c
+index 99c1eb1..a49ab7e 100644
+--- a/src/esx/esx_vi.c
++++ b/src/esx/esx_vi.c
+@@ -4,6 +4,7 @@
+  *
+  * Copyright (C) 2010-2012 Red Hat, Inc.
+  * Copyright (C) 2009-2012 Matthias Bolte <matthias.bolte@googlemail.com>
++ * Copyright (C) 2013 Ata E Husain Bohra <ata.husain@hotmail.com>
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -33,6 +34,7 @@
+ #include "viruuid.h"
+ #include "vmx.h"
+ #include "virxml.h"
++#include "virfile.h"
+ #include "esx_vi.h"
+ #include "esx_vi_methods.h"
+ #include "esx_util.h"
+@@ -115,6 +117,22 @@ ESX_VI__TEMPLATE__FREE(CURL,
+     virMutexDestroy(&item->lock);
+ })
+ 
++
++/* esxVI_FileData_Alloc */
++ESX_VI__TEMPLATE__ALLOC(FileData)
++
++
++/* esxVI_FileData_Free */
++ESX_VI__TEMPLATE__FREE(FileData,
++{
++    if (item->fHandle) {
++        if (VIR_FCLOSE(item->fHandle) < 0) {
++           VIR_FORCE_FCLOSE(item->fHandle);
++        }
++     }
++})
++
++
+ static size_t
+ esxVI_CURL_ReadString(char *data, size_t size, size_t nmemb, void *userdata)
+ {
+@@ -167,6 +185,85 @@ esxVI_CURL_WriteBuffer(char *data, size_t size, size_t nmemb, void *userdata)
+     return 0;
+ }
+ 
++/* 1 minute timeout to report upload status */
++#define UPLOAD_STATUS_TIMEOUT   30
++
++static size_t
++esxVI_CURL_ReadFile(void *data, size_t size, size_t nmemb, void *userdata)
++{
++    int result = -1;
++    size_t readsize = -1;
++    esxVI_FileData *fileData = (esxVI_FileData *) userdata;
++    esxVI_Int *percentage = NULL;
++    time_t cur_time = 0;
++    int elapsed = 0;
++
++    if ((fileData == NULL) ||
++        (fileData->fHandle == NULL)) {
++        return readsize;
++    }
++
++    if (fileData->cur_size == 0) {
++        readsize = 0;
++    } else {
++        if ((size*nmemb) > fileData->cur_size) {
++            readsize = fread(data, 1, fileData->cur_size,
++              (FILE*) fileData->fHandle);
++        } else {
++            readsize = fread(data, size, nmemb, (FILE*)fileData->fHandle);
++        }
++
++        fileData->cur_size -= readsize;
++    }
++
++    if (fileData->type == OVA_DISK) {
++        cur_time = time(NULL);
++        elapsed = cur_time - fileData->time_elapsed;
++
++        if (elapsed < UPLOAD_STATUS_TIMEOUT) {
++            /* no need to update upload progress */
++            result = 0;
++            goto cleanup;
++        }
++
++        if (fileData->ctx == NULL ||
++            fileData->lease == NULL) {
++            /* inability to extend lease may timeout the connection.
++             * Abort the transfer!
++             */
++            goto cleanup;
++        }
++
++        /**
++         * to extend the timeout we have to report upload progress
++         * to the server.
++         */
++        if (esxVI_Int_Alloc(&percentage) < 0) {
++            virReportOOMError();
++            goto cleanup;
++        }
++
++        percentage->value =
++            ((fileData->total_size - fileData->cur_size) * 100)/fileData->total_size;
++
++        esxVI_HttpNfcLeaseProgress(
++          fileData->ctx, fileData->lease, percentage);
++
++
++        fileData->time_elapsed = time(NULL);
++    }
++
++    result = 0;
++
++cleanup:
++
++    esxVI_Int_Free(&percentage);
++
++    return result < 0 ? -1 : readsize;
++
++}
++
++
+ #define ESX_VI__CURL__ENABLE_DEBUG_OUTPUT 0
+ 
+ #if ESX_VI__CURL__ENABLE_DEBUG_OUTPUT
+@@ -480,6 +577,55 @@ esxVI_CURL_Upload(esxVI_CURL *curl, const char *url, const char *content)
+     return 0;
+ }
+ 
++int esxVI_CURL_FileUpload(esxVI_CURL *curl, const char *url,
++                          esxVI_FileData *fileData)
++{
++    /*
++     * FIXME: VMDK upload does not work well as it stops the transfer
++     * after sending metadata. However, this method is used to upload
++     * OVA disk, given parsing OVA we extract the exact file offset
++     * to initiate the transfer.
++     */
++
++    int result = -1;
++    int responseCode = 0;
++
++    if (fileData == NULL || fileData->fHandle == NULL) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s", _("Invalid argument"));
++        goto cleanup;
++    }
++
++    virMutexLock(&curl->lock);
++
++    curl_easy_setopt(curl->handle, CURLOPT_POST, 1L);
++    curl_easy_setopt(curl->handle, CURLOPT_URL, url);
++    curl_easy_setopt(curl->handle, CURLOPT_READDATA, fileData);
++    curl_easy_setopt(curl->handle, CURLOPT_INFILESIZE,
++                        (curl_off_t) fileData->cur_size);
++    curl_easy_setopt(curl->handle, CURLOPT_READFUNCTION,
++                        esxVI_CURL_ReadFile);
++
++    responseCode = esxVI_CURL_Perform(curl, url);
++
++    virMutexUnlock(&curl->lock);
++
++    if (responseCode < 0) {
++        goto cleanup;
++    } else if (responseCode != 200 && responseCode != 201) {
++        virReportError(VIR_ERR_INTERNAL_ERROR,
++                       _("HTTP response code %d for upload to '%s'"),
++                       responseCode, url);
++        goto cleanup;
++    }
++
++    result = 0;
++
++cleanup:
++
++    return result;
++
++}
++
+ 
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+@@ -5213,5 +5359,4 @@ esxVI_LookupManagedObjectHelper(esxVI_Context *ctx,
+ }
+ 
+ 
+-
+ #include "esx_vi.generated.c"
+diff --git a/src/esx/esx_vi.h b/src/esx/esx_vi.h
+index 3eaeb38..324f931 100644
+--- a/src/esx/esx_vi.h
++++ b/src/esx/esx_vi.h
+@@ -1,9 +1,9 @@
+-
+ /*
+  * esx_vi.h: client for the VMware VI API 2.5 to manage ESX hosts
+  *
+  * Copyright (C) 2011 Red Hat, Inc.
+  * Copyright (C) 2009-2012 Matthias Bolte <matthias.bolte@googlemail.com>
++ * Copyright (C) 2013 Ata E Husain Bohra <ata.husain@hotmail.com>
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -75,6 +75,7 @@
+ typedef enum _esxVI_APIVersion esxVI_APIVersion;
+ typedef enum _esxVI_ProductVersion esxVI_ProductVersion;
+ typedef enum _esxVI_Occurrence esxVI_Occurrence;
++typedef enum _esxVI_UploadFileType esxVI_UploadFileType;
+ typedef struct _esxVI_ParsedHostCpuIdInfo esxVI_ParsedHostCpuIdInfo;
+ typedef struct _esxVI_CURL esxVI_CURL;
+ typedef struct _esxVI_SharedCURL esxVI_SharedCURL;
+@@ -84,6 +85,7 @@ typedef struct _esxVI_Response esxVI_Response;
+ typedef struct _esxVI_Enumeration esxVI_Enumeration;
+ typedef struct _esxVI_EnumerationValue esxVI_EnumerationValue;
+ typedef struct _esxVI_List esxVI_List;
++typedef struct _esxVI_FileData esxVI_FileData;
+ 
+ 
+ 
+@@ -167,6 +169,37 @@ int esxVI_CURL_Download(esxVI_CURL *curl, const char *url, char **content,
+                         unsigned long long offset, unsigned long long *length);
+ int esxVI_CURL_Upload(esxVI_CURL *curl, const char *url, const char *content);
+ 
++/* Upload Files to ESX server */
++
++/**
++ * Based on file, upload may be requied to do extra work.
++ * For instance: OVA file upload need to report upload transfer
++ * progress to extend Upload Lease
++ */
++enum _esxVI_UploadFileType {
++    VMDK,
++    OVA_DISK,
++    OTHERS
++};
++
++struct _esxVI_FileData
++{
++    FILE *fHandle;
++    off_t cur_size;              /* file size of the current file */
++    off_t total_size;            /* total size of all files */
++    esxVI_UploadFileType type;   /* type of file to upload */
++    /**
++     * below parameteres are mandatory only for OVA disk upload
++     */
++    esxVI_Context *ctx;
++    esxVI_ManagedObjectReference *lease;
++    time_t time_elapsed;          /* time since upload started */
++};
++
++int esxVI_FileData_Alloc(esxVI_FileData **fileData);
++void esxVI_FileData_Free(esxVI_FileData **fileData);
++int esxVI_CURL_FileUpload(esxVI_CURL *curl, const char *url,
++                          esxVI_FileData *fileData);
+ 
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+diff --git a/src/esx/esx_vi_generator.input b/src/esx/esx_vi_generator.input
+index 22c114e..eec135e 100644
+--- a/src/esx/esx_vi_generator.input
++++ b/src/esx/esx_vi_generator.input
+@@ -1363,6 +1363,12 @@ method FindByUuid                    returns ManagedObjectReference         o
+ end
+ 
+ 
++method HttpNfcLeaseProgress
++    ManagedObjectReference                  _this                           r
++    Int                                     percent                         r
++end
++
++
+ method Login                         returns UserSession                    r
+     ManagedObjectReference                   _this:sessionManager           r
+     String                                   userName                       r
+-- 
+1.7.9.5
+
