@@ -1,0 +1,570 @@
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index 95619f9..580a035 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -182,6 +182,7 @@ src/util/viruri.c
+ src/util/virusb.c
+ src/util/virutil.c
+ src/util/virxml.c
++src/util/virova.c
+ src/vbox/vbox_MSCOMGlue.c
+ src/vbox/vbox_XPCOMCGlue.c
+ src/vbox/vbox_driver.c
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 955973e..2c20433 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -116,6 +116,7 @@ UTIL_SOURCES =  						\
+   	util/virutil.c util/virutil.h			\
+   	util/viruuid.c util/viruuid.h			\
+   	util/virxml.c util/virxml.h			\
++  	util/virova.c util/virova.h			\
+   	$(NULL)
+ 
+ 
+diff --git a/src/util/virova.c b/src/util/virova.c
+new file mode 100644
+index 0000000..23709e0
+--- /dev/null
++++ b/src/util/virova.c
+@@ -0,0 +1,463 @@
++/*
++ * virova.c: OVA file handling/parsing
++ *
++ * Copyright (C) 2013 Ata E Husain Bohra <ata.husain@hotmail.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library.  If not, see
++ * <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include <config.h>
++#include "internal.h"
++
++#include <string.h>
++#include <sys/stat.h>
++#include <libxml/parser.h>
++#include <libxml/xpathInternals.h>
++
++#include "virova.h"
++#include "virfile.h"
++#include "virerror.h"
++#include "viralloc.h"
++#include "virbuffer.h"
++
++#define VIR_FROM_THIS VIR_FROM_NONE
++
++#define XMLCHAR_CAST(VALUE)  (const char *)(VALUE)
++
++/**
++ * OVA file is a tar file, the details of header/metadata are:
++ *
++ * ---------------- OVA/TAR Header--------------------------------------
++ *___________________________________________________________________
++ *| Field | Field |   Field                                          |
++ *| Offset| Size  |                                                  |
++ *|_______|_______|__________________________________________________|
++ *| 0     | 100   |File name                                         |
++ *| 100   | 8     |File mode                                         |
++ *| 108   | 8     |Owner's numeric user ID                           |
++ *| 116   | 8     |Group's numeric user ID                           |
++ *| 124   | 12    |File size in bytes                                |
++ *| 136   | 12    |Last modification time in numeric Unix time format|
++ *| 148   | 8     |Checksum for header block                         |
++ *| 156   | 1     |Link indicator (file type)                        |
++ *| 157   | 100   |Name of linked file                               |
++ *| 257   | 6     |TAR magic                                         |
++ *| 263   | 2     |Version                                           |
++ *|_______|_______|__________________________________________________|
++ */
++
++#define FILE_NAME_LENGTH  100
++#define FILE_SIZE_LENGTH  12
++#define HEADER_SIZE       512
++#define VERSION_LENGTH    2
++#define MAGIC_LENGTH      6
++
++static const char *MAGIC_STRING = "ustar";
++static const char *GNU_VERSION = " ";
++
++static const int  START_OFFSET           = 0L;
++static const int  FILE_SIZE_OFFSET       = 24L;
++static const int  MAGIC_OFFSET           = 257;
++static const int  VERSION_OFFSET         = 263L;
++static const int  HEADER_END_OFFSET      = 377L;
++static const char LARGE_FILE_OCTET       = '\200';
++
++static int validateOVAMagic(FILE *fHandle);
++
++
++/**
++ * validateOVAMagic: verify OVA magix string
++ *
++ * @fHandle: FILE*
++ *
++ * validate if given OVA package contains a valid TAR magic string.
++ */
++int
++validateOVAMagic(FILE *fHandle)
++{
++    int result = -1;
++    char magic[MAGIC_LENGTH+1] = {'\0'};
++    char version[VERSION_LENGTH+1] = {'\0'};
++    size_t bytesRead = 0;
++
++    if (fseeko(fHandle, MAGIC_OFFSET, SEEK_SET) < 0) {
++        virReportSystemError(errno, "%s", _("Seek error: OVA magic string"));
++        goto cleanup;
++    }
++
++    bytesRead = fread(magic, 1, MAGIC_LENGTH, fHandle);
++    if (bytesRead != MAGIC_LENGTH) {
++        virReportSystemError(errno, "%s", _("Unable to read magic string"));
++        goto cleanup;
++    }
++
++    if (STRNEQLEN(magic, MAGIC_STRING, MAGIC_LENGTH-1)) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("Invalid magic string"));
++        goto cleanup;
++    }
++
++    /* FIXME: Version string can be found at offset 263 in the header.
++     * Two supported tar version packages are:
++     * 1. POSIX_VERSION: version string is "00"
++     * 2. GNU_VERSION: version string is " "
++     *
++     * Current parsing support is valid ONLY for GNU VERSION format
++     */
++    if (fseeko(fHandle, VERSION_OFFSET, SEEK_SET) < 0) {
++        virReportSystemError(errno, "%s", _("Seek error: version string"));
++        goto cleanup;
++    }
++
++    bytesRead = fread(version, 1, VERSION_LENGTH, fHandle);
++    if (bytesRead != VERSION_LENGTH) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                          _("Error reading version string"));
++        goto cleanup;
++    }
++
++    if (STRNEQLEN(version, GNU_VERSION, VERSION_LENGTH-1)) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                          _("Only GNU VERSION OVA packages are supported"));
++        goto cleanup;
++    }
++
++    result = 0;
++
++cleanup:
++
++    /* ignore seek error */
++    fseeko(fHandle, START_OFFSET, SEEK_SET);
++
++    return result;
++
++}
++
++
++
++/**
++ * virParseOva
++ *
++ * @ovaPath: string containing full path of OVA file.
++ *
++ * Function open OVA package and populates virOVA struct
++ */
++int
++virParseOVA(const char *ovaPath, virOVAPtr *ret)
++{
++    int result  = -1;
++    virOVAPtr ova = NULL;
++    virOVADiskListPtr listItr = NULL;
++    char fileSizeBuff[FILE_SIZE_LENGTH+1] = {'\0'};
++    size_t bytesRead = 0;
++    off_t adjust = 0;
++    struct stat buff;
++
++    if (VIR_ALLOC(ova) < 0) {
++        virReportOOMError();
++        goto cleanup;
++    }
++
++    ova->fHandle = fopen(ovaPath, "r");
++    if (ova->fHandle == NULL) {
++        virReportSystemError(errno, "%s", _("Unable to open file"));
++        goto cleanup;
++    }
++
++    if (fstat(fileno(ova->fHandle), &buff) < 0) {
++        virReportSystemError(errno, "%s", _("File stat error"));
++        goto cleanup;
++    }
++
++    ova->totalSize = buff.st_size;
++
++    /* seek to the stating of the package */
++    if (fseeko(ova->fHandle, START_OFFSET, SEEK_SET) < 0) {
++        virReportSystemError(errno, "%s", _("File seek error"));
++        goto cleanup;
++    }
++
++    /* verify OVA magic string is valid. */
++    if (validateOVAMagic(ova->fHandle) < 0) {
++        goto cleanup;
++    }
++
++    /* extract details */
++    while (1) {
++        virOVADiskList *diskList = NULL;
++
++        if (VIR_ALLOC(diskList) < 0 ||
++            VIR_ALLOC(diskList->data)) {
++            virReportOOMError();
++            goto cleanup;
++        }
++
++        memset(diskList->data->name, '\0', FILE_NAME_LENGTH+1);
++        diskList->data->offset = 0;
++        diskList->data->size = 0;
++        diskList->next = NULL;
++
++        memset(fileSizeBuff, '\0', FILE_SIZE_LENGTH+1);
++
++        /* extract file name */
++        bytesRead = fread(diskList->data->name, 1, FILE_NAME_LENGTH,
++                          ova->fHandle);
++        if (bytesRead <= 0) {
++            virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                                _("Invalid file name"));
++            goto cleanup;
++        }
++
++        if (diskList->data->name[0] == '\0') {
++            /* package parsing is done */
++            VIR_FREE(diskList->data);
++            VIR_FREE(diskList);
++            break;
++        }
++
++        /* extract file size */
++        if (fseeko(ova->fHandle, FILE_SIZE_OFFSET, SEEK_CUR) < 0) {
++            virReportSystemError(VIR_ERR_INTERNAL_ERROR, "%s",
++                                        _("File seek error"));
++            goto cleanup;
++        }
++
++        bytesRead = fread(fileSizeBuff, 1, FILE_SIZE_LENGTH, ova->fHandle);
++        if (bytesRead <= 0) {
++            virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                                _("Invalid file length"));
++            goto cleanup;
++        }
++
++        /**
++         * if file size exceeds 8 G, then file size has to be obtained
++         * by reading 11 bytes of which first byte will be '\200'
++         */
++        if (fileSizeBuff[0] == LARGE_FILE_OCTET) {
++            const int byteSize = 4;
++            int i = 0;
++
++            for (i = 0; i < 8; ++i) {
++                uint8_t c = 0;
++                c = fileSizeBuff[byteSize + i];
++                diskList->data->size = (diskList->data->size << 8) | c;
++            }
++        } else {
++            sscanf(fileSizeBuff, "%lo", &diskList->data->size);
++        }
++
++        /* set the file content offset */
++        if (fseeko(ova->fHandle, HEADER_END_OFFSET, SEEK_CUR) < 0) {
++            virReportSystemError(errno, "%s", _("Seek error"));
++            VIR_FREE(diskList->data);
++            VIR_FREE(diskList);
++            goto cleanup;
++        }
++
++        diskList->data->offset = ftello(ova->fHandle) - 1;
++        if (diskList->data->offset < 0) {
++            virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                                _("Invalid file offset"));
++            VIR_FREE(diskList->data);
++            VIR_FREE(diskList);
++            goto cleanup;
++        }
++
++        /* adjust seek head to header size boundary */
++        adjust = diskList->data->size;
++        if (diskList->data->size % HEADER_SIZE) {
++            adjust = (adjust/HEADER_SIZE + 1) * HEADER_SIZE;
++        }
++
++        if (fseeko(ova->fHandle, adjust - 1, SEEK_CUR) < 0) {
++            virReportSystemError(errno, "%s", _("Seek error"));
++            goto cleanup;
++        }
++
++        if (!ova->head) {
++            ova->head = diskList;
++            listItr = ova->head;
++        } else {
++            listItr->next = diskList;
++            listItr = listItr->next;
++        }
++    }
++
++    *ret = ova;
++    result = 0;
++
++cleanup:
++
++    if (result < 0) {
++        virFreeOVA(ova);
++    }
++
++    return result;
++
++}
++
++
++/**
++ * virGetOVFDescriptor
++ *
++ * @ova: virOVAPtr
++ *
++ * Returns OVF descriptor string.
++ */
++
++int
++virGetOVFDescriptor(virOVAPtr ova, char **ret)
++{
++    int result = -1;
++    virOVADiskListPtr candidate = NULL;
++    char *fileExtension = NULL;
++    size_t bytesRead = 0;
++
++    if (ova == NULL || ret == NULL) {
++        goto cleanup;
++    }
++
++    /**
++     * TODO: OVA may have multiple OVF descriptors,
++     *       for now consider deploying only one OVF at once
++     */
++    for (candidate = ova->head; candidate != NULL;
++         candidate = candidate->next) {
++        if (!candidate->data) {
++            goto cleanup;
++        }
++        fileExtension = strrchr(candidate->data->name, '.');
++        if (fileExtension && STREQ(fileExtension, ".ovf")) {
++            break;
++        }
++    }
++
++    if (!candidate) {
++        /**
++         * OVA may have multiple OVF descriptor, leave error handling
++         * to the caller
++         */
++        goto cleanup;
++    }
++
++    if (fseeko(ova->fHandle, candidate->data->offset, SEEK_SET) < 0) {
++        virReportSystemError(errno, "%s", _("File seek error"));
++        goto cleanup;
++    }
++
++    if (VIR_ALLOC_N(*ret, candidate->data->size+1) < 0) {
++        virReportOOMError();
++        goto cleanup;
++    }
++
++    bytesRead = fread(*ret, 1, candidate->data->size, ova->fHandle);
++    if (bytesRead != candidate->data->size) {
++        virReportSystemError(errno, "%s", _("File read error"));
++        goto cleanup;
++    }
++
++    result = 0;
++
++cleanup:
++
++    return result;
++
++}
++
++
++
++/**
++ * virGetOVFDomainName
++ *
++ * Extract domain name from a OVF file
++ */
++char *
++virGetOVFDomainName(const char *ovf)
++{
++    char *domainName = NULL;
++    xmlNode *root_element = NULL;
++    xmlNode *curNode = NULL;
++    xmlNode *section = NULL;
++    xmlNode *element = NULL;
++    xmlDoc *doc = xmlReadMemory(ovf, strlen(ovf), NULL, NULL, 0);
++
++    if (!doc) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("Error reading OVF xml"));
++        goto cleanup;
++    }
++
++    root_element = xmlDocGetRootElement(doc);
++    for (curNode = root_element; curNode != NULL; curNode = curNode->next) {
++        if (STRCASENEQ(XMLCHAR_CAST(curNode->name), "envelope")) {
++            /* not the OVF root element */
++            continue;
++        }
++
++        for (section = curNode->children; section; section = section->next) {
++            if (STRCASENEQ(XMLCHAR_CAST(section->name), "virtualsystem")) {
++                /* wait for VirtualSystem section */
++                continue;
++            }
++
++            for (element = section->children; element ; element = element->next) {
++                if (STRCASENEQ(XMLCHAR_CAST(element->name), "name")) {
++                    continue;
++                }
++
++                domainName = strdup(XMLCHAR_CAST(xmlNodeGetContent(element)));
++            }
++        }
++    }
++
++cleanup:
++
++    xmlFreeDoc(doc);
++
++    return domainName;
++
++}
++
++
++
++/**
++ * virFreeOVA: free OVA structure members
++ */
++void virFreeOVA(virOVAPtr ova)
++{
++    struct _virOVADiskList *list = NULL;
++
++    if (ova == NULL) {
++        /* nothing to free */
++        return ;
++    }
++
++    if (VIR_FCLOSE(ova->fHandle) < 0) {
++        VIR_FORCE_FCLOSE(ova->fHandle);
++    }
++
++    /* iterate over linked list and free */
++    while (ova->head != NULL) {
++        list = ova->head;
++        ova->head = ova->head->next;
++
++        VIR_FREE(list->data);
++        VIR_FREE(list);
++    }
++
++    VIR_FREE(ova);
++
++}
+diff --git a/src/util/virova.h b/src/util/virova.h
+new file mode 100644
+index 0000000..df74e0f
+--- /dev/null
++++ b/src/util/virova.h
+@@ -0,0 +1,68 @@
++/*
++ * virova.h: OVA file handling/parsing
++ *
++ * Copyright (C) 2013 Ata E Husain Bohra <ata.husain@hotmail.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library.  If not, see
++ * <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#ifndef __VIR_OVA_H_
++# define __VIR_OVA_H_
++
++# include <fcntl.h>
++# include <stdio.h>
++
++typedef struct _virOVADiskList virOVADiskList;
++typedef struct _virOVADiskFile virOVADiskFile;
++typedef struct _virOVA virOVA;
++
++/* opaque management of OVA file details */
++struct _virOVADiskFile {
++    char        name[101];          /* TAR header file name limit */
++    off_t       size;               /* virtual disk file size */
++    off_t       offset;             /* virtual disk file offset */
++};
++
++typedef virOVADiskFile *virOVADiskFilePtr;
++
++/* opaque type to maintain OVA files as single pointer linked list */
++struct _virOVADiskList {
++    struct _virOVADiskList     *next;
++    virOVADiskFilePtr          data;
++};
++
++typedef virOVADiskList *virOVADiskListPtr;
++
++/**
++ * parse OVA and populate the containing file details (OVA desc, vDisk etc.)
++ */
++struct _virOVA {
++    FILE*                       fHandle;   /* file handle for OVA file */
++    virOVADiskListPtr           head;      /* virtual disk single linked list */
++    off_t                       totalSize; /* total size of OVA package */
++};
++
++typedef virOVA *virOVAPtr;
++
++int virParseOVA(const char *ovaPath, virOVAPtr *ret);
++
++int virGetOVFDescriptor(virOVAPtr ova, char **ret);
++
++char *virGetOVFDomainName(const char *ovf);
++
++void virFreeOVA(virOVAPtr ova);
++
++#endif /* __VIR_OVA_H_ */
+-- 
+1.7.9.5
+
