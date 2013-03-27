@@ -1,0 +1,1730 @@
+diff --git a/src/esx/esx_driver.c b/src/esx/esx_driver.c
+index 1366c81..d4f4ce4 100644
+--- a/src/esx/esx_driver.c
++++ b/src/esx/esx_driver.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2010-2012 Red Hat, Inc.
+  * Copyright (C) 2009-2012 Matthias Bolte <matthias.bolte@googlemail.com>
+  * Copyright (C) 2009 Maximilian Wilhelm <max@rfc2324.org>
++ * Copyright (C) 2013 Ata E Husain Bohra <ata.husain@hotmail.com>
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -32,6 +33,7 @@
+ #include "viralloc.h"
+ #include "virlog.h"
+ #include "viruuid.h"
++#include "virfile.h"
+ #include "vmx.h"
+ #include "virtypedparam.h"
+ #include "esx_driver.h"
+@@ -46,10 +48,16 @@
+ #include "esx_vi_methods.h"
+ #include "esx_util.h"
+ #include "viruri.h"
++#include "virova.h"
+ 
+ #define VIR_FROM_THIS VIR_FROM_ESX
+ 
++
+ static int esxDomainGetMaxVcpus(virDomainPtr domain);
++static int esxDomainUploadDisks(virConnectPtr conn,
++                                esxVI_ManagedObjectReference *nfcLease,
++                                esxVI_OvfCreateImportSpecResult *importResult,
++                                virOVAPtr ova);
+ 
+ typedef struct _esxVMX_Data esxVMX_Data;
+ 
+@@ -59,7 +67,6 @@ struct _esxVMX_Data {
+ };
+ 
+ 
+-
+ static void
+ esxFreePrivate(esxPrivate **priv)
+ {
+@@ -3304,6 +3311,569 @@ esxDomainDefineXML(virConnectPtr conn, const char *xml)
+ 
+ 
+ static int
++esxDomainUploadDisks(virConnectPtr conn,
++                     esxVI_ManagedObjectReference *nfcLease,
++                     esxVI_OvfCreateImportSpecResult *importResult,
++                     virOVAPtr ova)
++{
++    int result = -1;
++    esxPrivate* priv = conn->privateData;
++    esxVI_Context *ctx = priv->primary;
++    esxVI_String *propertyNameInfo = NULL;
++    esxVI_DynamicProperty *dynamicProperty = NULL;
++    esxVI_ObjectContent *infoObject = NULL;
++    esxVI_HttpNfcLeaseInfo *httpNfcInfo = NULL;
++    esxVI_HttpNfcLeaseDeviceUrl *deviceUrl  = NULL;
++    esxVI_FileData *fileData = NULL;
++    esxVI_CURL *curl = NULL;
++    virBuffer buffer = VIR_BUFFER_INITIALIZER;
++    virOVADiskListPtr listDisk = NULL;
++    bool ready = false;
++    char *uploadUrl = NULL;
++    char *fileExtension = NULL;
++    off_t bytesToSend = 0;
++    int numAttempts = 0;
++    char cl_string[64] = {'\0'};
++    int fd = -1;
++
++    if (!ova || !ova->fHandle) {
++        goto cleanup;
++    }
++
++    /**
++     * obtain file handle for OVA file, it is better to re-open
++     * file while uploading given disk. Cleanup for esxVI_FileData and
++     * virFreeOVA remains simple and clean this way
++     */
++    fd = fileno(ova->fHandle);
++    if (fd <= 0) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                _("Invalid fielno for OVA file"));
++        goto cleanup;
++    }
++
++    if (esxVI_String_AppendValueListToList(&propertyNameInfo,
++                                       "info\0state\0error\0") < 0) {
++        return -1;
++    }
++
++    if (esxVI_CURL_Alloc(&curl) < 0) {
++        virReportOOMError();
++        goto cleanup;
++    }
++
++    /**
++     * CURL headers for streaming vmdk are different from normal
++     * execution headers, open a dedicated curl->handle to upload
++     * VMDKs
++     */
++    curl->handle = curl_easy_init();
++    if (!curl->handle) {
++        fprintf(stderr, "curl init failed");
++        goto cleanup;
++    }
++
++    /**
++     * vSphere API recommends wait till ESX sets the status to
++     * "ready" before initiating disk transfer. Wait for max
++     * 10 seconds before giving up!
++     *
++     * TODO May be convert it to WaitForUpdate call */
++    for (ready = false, numAttempts = 0;
++         ready != true && numAttempts < 10; ++numAttempts) {
++        esxVI_ObjectContent_Free(&infoObject);
++
++        if (esxVI_LookupObjectContentByType(ctx, nfcLease,
++                    "HttpNfcLease", propertyNameInfo,
++                    &infoObject, esxVI_Occurrence_RequiredItem) < 0) {
++            goto cleanup;
++        }
++
++        for (dynamicProperty = infoObject->propSet; dynamicProperty != NULL;
++                dynamicProperty = dynamicProperty->_next) {
++            if (STREQ(dynamicProperty->name, "state")) {
++                if (STREQ(dynamicProperty->val->value, "initializing")) {
++                    /* check after sometime */
++                    sleep(1);
++                } else {
++                    ready = true;
++                }
++            } else if (STREQ(dynamicProperty->name, "error")) {
++                virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                                dynamicProperty->val->value);
++                goto cleanup;
++            }
++        }
++    }
++
++    if (!ready) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("ESX server not ready for disk upload"));
++        goto cleanup;
++    }
++
++    /**
++     * Better to retrieve "info" object again once the ESX server
++     * is "ready"
++     */
++    esxVI_String_Free(&propertyNameInfo);
++    esxVI_ObjectContent_Free(&infoObject);
++    if (esxVI_String_AppendValueListToList(
++          &propertyNameInfo, "info\0") < 0 ||
++        esxVI_LookupObjectContentByType(
++          ctx, nfcLease, "HttpNfcLease", propertyNameInfo,
++          &infoObject, esxVI_Occurrence_RequiredItem) < 0) {
++        goto cleanup;
++    }
++
++    for (dynamicProperty = infoObject->propSet; dynamicProperty != NULL;
++         dynamicProperty = dynamicProperty->_next) {
++        if (STREQ(dynamicProperty->name, "info")) {
++            if (esxVI_HttpNfcLeaseInfo_CastFromAnyType(
++                  dynamicProperty->val, &httpNfcInfo) < 0) {
++                goto cleanup;
++            }
++        }
++    }
++
++    bytesToSend = ova->totalSize;
++    for (listDisk = ova->head; listDisk != NULL; listDisk = listDisk->next) {
++        fileExtension = strrchr(listDisk->data->name, '.');
++        if (!fileExtension || STRNEQ(fileExtension, ".vmdk")) {
++            /* not a VMDK */
++            continue ;
++        }
++
++        /* iterate over deviceUri and upload VMDK files from OVA */
++        for (deviceUrl = httpNfcInfo->deviceUrl;
++             deviceUrl != NULL; deviceUrl = deviceUrl->_next) {
++            virOVADiskListPtr candidate = NULL;
++            esxVI_OvfFileItem *fileItem = NULL;
++            int position = -1;
++            char *ptr_char = NULL;
++
++            /* ESXi HttpLeaseInfo object when returned have "url"(s) to be
++             * used to upload VMDK files. The format of the url is
++             * https://\\*\\/<session-id>/<vmdk-file-name>
++             * Replaces the "\\*" with approriate server IP address.
++             */
++
++            VIR_FREE(uploadUrl);
++            virBufferFreeAndReset(&buffer);
++
++            if (!deviceUrl->url) {
++                goto cleanup;
++            }
++
++            position = strcspn(deviceUrl->url, "*");
++            if (position <= 0) {
++                goto cleanup;
++            }
++
++            virBufferAdd(&buffer, deviceUrl->url, position);
++
++            ptr_char = strchr(deviceUrl->url, '*');
++            if (ptr_char == NULL) {
++                goto cleanup;
++            }
++
++            virBufferStrcat(&buffer, ctx->ipAddress, NULL);
++            virBufferStrcat(&buffer, ptr_char + 1, NULL);
++            uploadUrl = virBufferContentAndReset(&buffer);
++
++            /* iterate virOVA struct to find relevant file details */
++            for (fileItem = importResult->fileItem;
++                 fileItem != NULL; fileItem = fileItem->_next) {
++                if (STREQ(deviceUrl->importKey, fileItem->deviceId)) {
++                    break;
++                }
++            }
++
++            if (!fileItem || !fileItem->path) {
++                goto cleanup;
++            }
++
++            candidate = ova->head;
++            for (; candidate != NULL; candidate = candidate->next) {
++                if (STREQ(candidate->data->name, fileItem->path)) {
++
++                    esxVI_FileData_Free(&fileData);
++                    if (esxVI_FileData_Alloc(&fileData) < 0) {
++                        virReportOOMError();
++                        goto cleanup;
++                    }
++
++                    fileData->fHandle = VIR_FDOPEN(fd, "r");
++                    if (!fileData->fHandle) {
++                        goto cleanup;
++                    }
++
++                    /* Seek the file to the proper offset */
++                    if (fseeko(fileData->fHandle, candidate->data->offset,
++                               SEEK_SET) < 0) {
++                        goto cleanup;
++                    }
++
++                    fileData->ctx = ctx;
++                    fileData->lease = nfcLease;
++                    fileData->cur_size = candidate->data->size;
++                    fileData->time_elapsed = time(NULL);
++                    fileData->total_size = bytesToSend;
++                    fileData->type = OVA_DISK;
++
++                    if (curl->headers) {
++                        curl_slist_free_all(curl->headers);
++                    }
++
++                    /**
++                     * Prepare the header to reflect the vmware-vdisk
++                     * stream with proper size sever should expect
++                     */
++                    curl->headers = curl_slist_append(curl->headers,
++                      "Connection: Keep-Alive");
++                    curl->headers = curl_slist_append(curl->headers,
++                      "Content-Type: application/x-vnd.vmware-streamVmdk");
++
++                    memset(cl_string, '\0', sizeof(cl_string));
++                    snprintf(cl_string, sizeof(cl_string),
++                                "Content-Length: %ld", fileData->cur_size);
++                    curl->headers = curl_slist_append(curl->headers, cl_string);
++
++                    if (curl->headers == NULL) {
++                        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                          _("Could not build CURL header list"));
++                        goto cleanup;
++                    }
++
++                    curl_easy_setopt(
++                      curl->handle, CURLOPT_HTTPHEADER , curl->headers);
++                    curl_easy_setopt(curl->handle, CURLOPT_SSL_VERIFYPEER, false);
++                    curl_easy_setopt(curl->handle, CURLOPT_SSL_VERIFYHOST, false);
++
++
++                    if (esxVI_CURL_FileUpload(curl, uploadUrl,
++                                              fileData) < 0) {
++                        goto cleanup;
++                    }
++
++                    bytesToSend -= candidate->data->size;
++                }
++            }
++        }
++    }
++
++    result = 0;
++
++cleanup:
++
++    esxVI_String_Free(&propertyNameInfo);
++    esxVI_ObjectContent_Free(&infoObject);
++    esxVI_HttpNfcLeaseInfo_Free(&httpNfcInfo);
++    esxVI_FileData_Free(&fileData);
++    esxVI_CURL_Free(&curl);
++    virBufferFreeAndReset(&buffer);
++    VIR_FREE(uploadUrl);
++
++    return result;
++
++}
++
++
++
++static virDomainPtr
++esxDomainDefineOVA(virConnectPtr conn, const char *ovaPath,
++                   const char *datastoreName)
++{
++    virDomainPtr domain = NULL;
++    virOVAPtr ova = NULL;
++    esxPrivate* priv = conn->interfacePrivateData;
++    esxVI_Context *ctx = priv->primary;
++    esxVI_OvfParseDescriptorParams *pdp = NULL;
++    esxVI_OvfParseDescriptorResult *pdResult = NULL;
++    esxVI_OvfCreateImportSpecParams *cisp = NULL;
++    esxVI_ObjectContent *datastore = NULL;
++    esxVI_OvfCreateImportSpecResult *importResult = NULL;
++    esxVI_ManagedObjectReference *nfcLease = NULL;
++    esxVI_ManagedObjectReference *ovfManager = NULL;
++    char *ovfDescriptor = NULL;
++    char *escapedOvfDescriptor = NULL;
++    char *domainName = NULL;
++    struct curl_slist *headers = NULL;
++    const struct curl_slist *old_headers = NULL;
++
++    if (esxVI_EnsureSession(priv->primary) < 0 ||
++        virParseOVA(ovaPath, &ova) < 0) {
++        goto cleanup;
++    }
++
++    /**
++     * FIXME: vSphere API v2.5 does expose all relevant information
++     *        needed by ESXi servers suporting vSphere API version 4.0
++     *        or above. As per API version 4.0, the connection header
++     *        or execution CURL header should include:
++     *        "SOAPACTION: urn:vim25"
++     *        header field, otherwise, ServiceContent object is not
++     *        fully populated and miss references to MoBs such as:
++     *        ovfManager. Also, this namespace is necessary to expose
++     *        API methods such as: ParseDescriptor, CreateImportSpec
++     *        and ImportVApp.
++     *
++     *        But, adding this header item in esxVI_XXX initial functions has
++     *        various bad affects:
++     *        1. Ordering of other MoB deserialization is affected that breaks
++     *           existing code (this one is big risk)
++     *        2. Namespace add extra fields that may cause warning messages
++     *           (this one is benign though)
++     *
++     * To avoid breaking existing API calls, modify CURL headers in this
++     * routine to include "SOAPACTION" field.
++     */
++    if (ctx->service->ovfManager == NULL) {
++
++        headers = curl_slist_append(headers,
++          "Content-Type: text/xml; charset=UTF-8");
++        headers = curl_slist_append(headers, "Expect:");
++        headers = curl_slist_append(headers,
++          "SOAPAction: \"urn:vim25\"");
++        if (headers == NULL) {
++            virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++              _("Could not build CURL header list"));
++            goto cleanup;
++        }
++
++        old_headers = ctx->curl->headers;
++        curl_easy_setopt(ctx->curl->handle, CURLOPT_HTTPHEADER , headers);
++
++        if (esxVI_ManagedObjectReference_Alloc(&ovfManager) < 0) {
++            virReportOOMError();
++            goto cleanup;
++        }
++
++        ovfManager->_next = NULL;
++        ovfManager->_type = esxVI_Type_ManagedObjectReference;
++        ovfManager->type = strdup("OvfManager");
++        ovfManager->value = strdup("ha-ovf-manager");
++    }
++
++    /**
++     * OVA installation is a multi step process:
++     *
++     * Step 1: ParseDescriptor:
++     *         run OVF descriptor by hypervisor to see if it is deployable.
++     */
++    if (esxVI_OvfParseDescriptorParams_Alloc(&pdp) < 0) {
++        virReportOOMError();
++        goto cleanup;
++    }
++
++    pdp->locale = strdup("en-US");
++    pdp->deploymentOption = strdup("");
++
++    if (virGetOVFDescriptor(ova, &ovfDescriptor) < 0 ||
++        ovfDescriptor == NULL) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("Missing OVF descriptor"));
++        goto cleanup;
++    };
++
++    escapedOvfDescriptor = esxUtil_EscapeForXml(ovfDescriptor);
++    if (escapedOvfDescriptor == NULL) {
++        goto cleanup;
++    }
++
++    if (ctx->service->ovfManager) {
++        if (esxVI_ParseDescriptor(ctx, ctx->service->ovfManager,
++                                  escapedOvfDescriptor, pdp, &pdResult) < 0) {
++            goto cleanup;
++        }
++    } else {
++        if (esxVI_ParseDescriptor(ctx, ovfManager, escapedOvfDescriptor,
++                                  pdp, &pdResult) < 0) {
++            goto cleanup;
++        }
++    }
++
++    if (pdResult == NULL) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                          _("ParseDescriptor: NULL return value"));
++        goto cleanup;
++    } else if (pdResult->error) {
++        esxVI_LocalizedMethodFault *pFault = NULL;
++
++        for (pFault = pdResult->error;
++          pFault != NULL;
++          pFault = pFault->_next) {
++            if (pFault->localizedMessage) {
++                virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                  pFault->localizedMessage);
++            }
++        }
++
++        goto cleanup;
++    }
++
++    /*
++     * Step 2: InstallvAPP:
++     *         create virtual machine entity on the hypervisor.
++     */
++    if (esxVI_OvfCreateImportSpecParams_Alloc(&cisp) < 0) {
++        virReportOOMError();
++        goto cleanup;
++    }
++
++    domainName = virGetOVFDomainName(ovfDescriptor);
++    if (domainName == NULL) {
++        goto cleanup;
++    }
++
++    cisp->locale = strdup("en-US");
++    cisp->deploymentOption = strdup("");
++    cisp->entityName = strdup(domainName);
++
++    if (esxVI_ManagedObjectReference_DeepCopy(
++          &cisp->hostSystem, priv->host->hostSystem->_reference) < 0 ||
++        esxVI_LookupDatastoreByName(ctx, datastoreName, NULL, &datastore,
++                                    esxVI_Occurrence_RequiredItem) < 0) {
++        goto cleanup;
++    }
++
++
++    cisp->ipAllocationPolicy = strdup("fixedPolicy");
++    cisp->ipProtocol = strdup("IPv4");
++    cisp->diskProvisioning = strdup("thick");
++
++    if (ctx->service->ovfManager) {
++        if (esxVI_CreateImportSpec(
++              ctx, ctx->service->ovfManager, escapedOvfDescriptor,
++              priv->primary->computeResource->resourcePool,
++              datastore->obj, cisp, &importResult) < 0) {
++            goto cleanup;
++        }
++    } else {
++        if (esxVI_CreateImportSpec(
++              ctx, ovfManager, escapedOvfDescriptor,
++              priv->primary->computeResource->resourcePool,
++              datastore->obj, cisp, &importResult) < 0) {
++            goto cleanup;
++        }
++    }
++
++    if (importResult == NULL) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("CreateImportSpec returned NULL."));
++        goto cleanup;
++    } else {
++        if (!importResult->error) {
++            if (importResult->warning) {
++                esxVI_LocalizedMethodFault *pWarn= NULL;
++                for (pWarn = importResult->warning;
++                     pWarn != NULL;
++                     pWarn = pWarn->_next) {
++                    if (pWarn->localizedMessage) {
++                        VIR_WARN("%s", pWarn->localizedMessage);
++                    }
++                }
++            }
++        } else {
++            esxVI_LocalizedMethodFault *pFault = NULL;
++
++            for (pFault = importResult->error;
++              pFault != NULL;
++              pFault = pFault->_next) {
++                if (pFault->localizedMessage) {
++                    virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                      pFault->localizedMessage);
++                }
++            }
++
++            goto cleanup;
++        }
++    }
++
++    if (!importResult->importSpec) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("InstallVApp : ImportSpec is NULL"));
++        goto cleanup;
++    }
++
++    /* Step 3: ImportVApp: this will create the VApp entity on the
++     * ESXi box.
++     */
++    if (esxVI_ImportVApp(ctx,
++                         priv->primary->computeResource->resourcePool,
++                         importResult->importSpec,
++                         priv->primary->datacenter->vmFolder,
++                         priv->host->hostSystem->_reference,
++                         &nfcLease) < 0) {
++        goto cleanup;
++    }
++
++    if (nfcLease == NULL) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("ImportVApp: lease NULL."));
++        goto cleanup;
++    }
++
++    /*
++     * Step 3: Transfer VMDKs:
++     *         if VM creation is a success, ESX provides the lease object
++     *         with URL to upload vmdks to the ESX server.
++     */
++
++    if (esxDomainUploadDisks(conn, nfcLease, importResult, ova) < 0) {
++        goto abort;
++    }
++
++    /* Done: installation */
++    if (esxVI_HttpNfcLeaseComplete(ctx, nfcLease) < 0) {
++        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
++                        _("ImportVApp: VMDK upload complete error"));
++        goto abort;
++    }
++
++    domain = esxDomainLookupByName(conn, domainName);
++
++ cleanup:
++
++    esxVI_OvfParseDescriptorParams_Free(&pdp);
++    esxVI_OvfParseDescriptorResult_Free(&pdResult);
++    esxVI_OvfCreateImportSpecParams_Free(&cisp);
++    esxVI_OvfCreateImportSpecResult_Free(&importResult);
++    esxVI_ObjectContent_Free(&datastore);
++    esxVI_ManagedObjectReference_Free(&nfcLease);
++    esxVI_ManagedObjectReference_Free(&ovfManager);
++    VIR_FREE(ovfDescriptor);
++    VIR_FREE(escapedOvfDescriptor);
++    VIR_FREE(domainName);
++    virFreeOVA(ova);
++
++    if (old_headers) {
++        curl_easy_setopt(ctx->curl->handle, CURLOPT_HTTPHEADER , old_headers);
++    }
++
++    if (headers) {
++        curl_slist_free_all(headers);
++    }
++
++    return domain;
++
++ abort:
++
++    /* Abort the Lease */
++    if (nfcLease != NULL) {
++        /**
++         * ESXi will clean up the lease objects when the timeout expires
++         * ignore if this calls fails.
++         */
++        esxVI_HttpNfcLeaseAbort(ctx, nfcLease);
++    }
++
++    goto cleanup;
++
++}
++
++
++static int
+ esxDomainUndefineFlags(virDomainPtr domain,
+                        unsigned int flags)
+ {
+@@ -5284,6 +5854,7 @@ static virDriver esxDriver = {
+     .domainCreate = esxDomainCreate, /* 0.7.0 */
+     .domainCreateWithFlags = esxDomainCreateWithFlags, /* 0.8.2 */
+     .domainDefineXML = esxDomainDefineXML, /* 0.7.2 */
++    .domainDefineOVA = esxDomainDefineOVA, /* 1.0.2 */
+     .domainUndefine = esxDomainUndefine, /* 0.7.1 */
+     .domainUndefineFlags = esxDomainUndefineFlags, /* 0.9.4 */
+     .domainGetAutostart = esxDomainGetAutostart, /* 0.9.0 */
+diff --git a/src/esx/esx_vi_generator.input b/src/esx/esx_vi_generator.input
+index eec135e..5f0df45 100644
+--- a/src/esx/esx_vi_generator.input
++++ b/src/esx/esx_vi_generator.input
+@@ -51,10 +51,17 @@
+ # Enumerations
+ #
+ 
++enum ArrayUpdateOperation
++   add
++   edit
++   remove
++end
++
++
+ enum AutoStartWaitHeartbeatSetting
+-    yes
+-    no
+-    systemDefault
++   yes
++   no
++   systemDefault
+ end
+ 
+ 
+@@ -66,6 +73,14 @@ enum FibreChannelPortType
+ end
+ 
+ 
++enum HttpNfcLeaseState
++    initializing
++    ready
++    done
++    error
++end
++
++
+ enum ManagedEntityStatus
+     gray
+     green
+@@ -122,6 +137,27 @@ enum TaskInfoState
+ end
+ 
+ 
++enum VirtualDeviceConfigSpecFileOperation
++    create
++    destroy
++    replace
++end
++
++
++enum VirtualDeviceConfigSpecOperation
++    add
++    edit
++    remove
++end
++
++
++enum VirtualSCSISharing
++    noSharing
++    physicalSharing
++    virtualSharing
++end
++
++
+ enum VirtualMachineMovePriority
+     lowPriority
+     highPriority
+@@ -136,6 +172,17 @@ enum VirtualMachinePowerState
+ end
+ 
+ 
++enum VirtualMachineToolsStatus
++    toolsNotInstalled
++    toolsNotRunning
++    toolsOk
++    toolsOld
++end
++
++enum vStorageSupport
++    vStorageUnknown
++end
++
+ # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+ # Objects
+ #
+@@ -158,6 +205,12 @@ object AboutInfo
+ end
+ 
+ 
++object ArrayUpdateSpec
++   ArrayUpdateOperation                      operation                      r
++   AnyType                                   removeKey                      o
++end
++
++
+ object AutoStartDefaults
+     Boolean                                  enabled                        o
+     Int                                      startDelay                     o
+@@ -184,6 +237,26 @@ object ChoiceOption                  extends OptionType
+ end
+ 
+ 
++object ClusterDasVmConfigSpec extends ArrayUpdateSpec
++    ClusterDasVmConfigInfo                   info                           i
++end
++
++
++object ClusterDpmHostConfigSpec extends ArrayUpdateSpec
++    ClusterDpmHostConfigInfo                 info                           i
++end
++
++
++object ClusterRuleSpec extends ArrayUpdateSpec
++    ClusterRuleInfo                          info                           i
++end
++
++
++object ClusterDrsVmConfigSpec extends ArrayUpdateSpec
++   ClusterDrsVmConfigInfo                    info                           i
++end
++
++
+ object DatastoreHostMount
+     ManagedObjectReference                   key                            r
+     HostMountInfo                            mountInfo                      r
+@@ -740,6 +813,64 @@ object HostVmfsVolume                extends HostFileSystemVolume
+ end
+ 
+ 
++object HttpNfcLease
++    LocalizedMethodFault                     error                          o
++    HttpNfcLeaseInfo                         info                           o
++    Int                                      initializeProgress             r
++    HttpNfcLeaseState                        state                          r
++end
++
++
++object HttpNfcLeaseDatastoreLeaseInfo
++    String                                  datastoreKey                    r
++    HttpNfcLeaseHostInfo                    hosts                           rl
++end
++
++
++object HttpNfcLeaseDeviceUrl
++    String                                   datastoreKey                   o
++    Boolean                                  disk                           o
++    Long                                     fileSize                       o
++    String                                   importKey                      r
++    String                                   key                            r
++    String                                   sslThumbprint                  r
++    String                                   targetId                       o
++    String                                   url                            r
++end
++
++
++object HttpNfcLeaseHostInfo
++    String                                   sslThumbprint                  r
++    String                                   url                            r
++end
++
++
++object HttpNfcLeaseInfo
++    HttpNfcLeaseDeviceUrl                    deviceUrl                      ol
++    ManagedObjectReference                   entity                         r
++    HttpNfcLeaseDatastoreLeaseInfo           hostMap                        ol
++    ManagedObjectReference                   lease                          r
++    Int                                      leaseTimeout                   r
++    Long                                     totalDiskCapacityInKB          r
++end
++
++
++
++object HttpNfcLeaseManifestEntry
++    Long                                     capacity                       o
++    Boolean                                  disk                           r
++    String                                   key                            r
++    Long                                     populatedSize                  o
++    String                                   sha1                           r
++    Long                                     size                           r
++end
++
++
++object ImportSpec
++     VAppEntityConfigInfo                    entityConfig                    o
++end
++
++
+ object IsoImageFileInfo              extends FileInfo
+ end
+ 
+@@ -754,6 +885,12 @@ object KeyAnyValue
+ end
+ 
+ 
++object KeyValue
++    String                                   key                            r
++    String                                   value                          r
++end
++
++
+ object LocalDatastoreInfo            extends DatastoreInfo
+     String                                   path                           o
+ end
+@@ -792,6 +929,11 @@ object ObjectUpdate
+ end
+ 
+ 
++object OptionDef extends ElementDescription
++    OptionType                               optionType                     r
++end
++
++
+ object OptionType
+     Boolean                                  valueIsReadonly                o
+ end
+@@ -803,6 +945,97 @@ object OptionValue
+ end
+ 
+ 
++object OvfCreateImportSpecParams extends OvfManagerCommonParams
++    String                                  entityName                      r
++    ManagedObjectReference                  hostSystem                      o
++    OvfNetworkMapping                       networkMapping                  ol
++    String                                  ipAllocationPolicy              o
++    String                                  ipProtocol                      o
++    String                                  diskProvisioning                o
++    KeyValue                                propertyMapping                 ol
++    OvfResourceMap                          resourceMapping                 ol
++
++end
++
++
++object OvfCreateImportSpecResult
++    LocalizedMethodFault                    error                           ol
++    OvfFileItem                             fileItem                        ol
++    VirtualMachineImportSpec                importSpec                      o
++    LocalizedMethodFault                    warning                         ol
++end
++
++
++object OvfDeploymentOption
++    String                                  description                     r
++    String                                  key                             r
++    String                                  label                           r
++end
++
++
++object OvfFileItem
++    Long                                    chunkSize                       o
++    Int                                     cimType                         r
++    String                                  compressionMethod               o
++    Boolean                                 create                          r
++    String                                  deviceId                        r
++    String                                  path                            r
++    Long                                    size                            o
++end
++
++
++object OvfManagerCommonParams
++    String                                   locale                         r
++    String                                   deploymentOption               r
++    KeyValue                                 msgBundle                      ol
++end
++
++
++object OvfNetworkInfo
++    String                                  description                     r
++    String                                  name                            r
++end
++
++
++object OvfNetworkMapping
++    String                                  name                            r
++    ManagedObjectReference                  network                         r
++end
++
++
++object OvfParseDescriptorParams extends OvfManagerCommonParams
++end
++
++
++object OvfParseDescriptorResult
++    String                                   annotation                     o
++    Long                                     approximateDownloadSize        o
++    Long                                     approximateFlatDeploymentSize  o
++    Long                                     approximateSparseDeploymentSize    o
++    String                                   defaultDeploymentOption        r
++    String                                   defaultEntityName              r
++    OvfDeploymentOption                      deploymentOption               ol
++    KeyValue                                 entityName                     ol
++    LocalizedMethodFault                     error                          ol
++    String                                   eula                           ol
++    String                                   ipAllocationScheme             ol
++    String                                   ipProtocols                    ol
++    OvfNetworkInfo                           network                        ol
++    VAppProductInfo                          productInfo                    o
++    VAppPropertyInfo                         property                       ol
++    Boolean                                  virtualApp                     r
++    LocalizedMethodFault                     warning                        ol
++end
++
++
++object OvfResourceMap
++    ManagedObjectReference                  datastore                       o
++    ManagedObjectReference                  parent                          o
++    ResourceConfigSpec                      resourceSpec                    o
++    String                                  source                          r
++end
++
++
+ object PerfCounterInfo
+     Int                                      key                            r
+     ElementDescription                       nameInfo                       r
+@@ -911,6 +1144,15 @@ object PropertySpec
+ end
+ 
+ 
++object ResourceConfigSpec
++    String                                  changeVersion                   o
++    ResourceAllocationInfo                  cpuAllocation                   r
++    ManagedObjectReference                  entity                          o
++    DateTime                                lastModified                    o
++    ResourceAllocationInfo                  memoryAllocation                r
++end
++
++
+ object ResourceAllocationInfo
+     Long                                     reservation                    o
+     Boolean                                  expandableReservation          o
+@@ -1017,6 +1259,18 @@ object SharesInfo
+ end
+ 
+ 
++object StorageIOAllocationInfo
++    Long                                     limit                          o
++    SharesInfo                               shares                         o
++end
++
++
++object StringOption                  extends OptionType
++   String                                    defaultValue                   r
++   String                                    validCharacters                o
++end
++
++
+ object TaskInfo
+     String                                   key                            r
+     ManagedObjectReference                   task                           r
+@@ -1051,6 +1305,19 @@ object TemplateConfigFileQuery       extends VmConfigFileQuery
+ end
+ 
+ 
++object ToolsConfigInfo
++    Boolean                                  afterPowerOn                   o
++    Boolean                                  afterResume                    o
++    Boolean                                  beforeGuestStandby             o
++    Boolean                                  beforeGuestShutdown            o
++    Boolean                                  beforeGuestReboot              o
++    String                                   pendingCustomization           o
++    Boolean                                  syncTimeWithHost               o
++    String                                   toolsUpgradePolicy             o
++    Int                                      toolsVersion                   o
++end
++
++
+ object TraversalSpec                 extends SelectionSpec
+     String                                   type                           r
+     String                                   path                           r
+@@ -1073,6 +1340,175 @@ object UserSession
+     DateTime                                 lastActiveTime                 r
+     String                                   locale                         r
+     String                                   messageLocale                  r
++    Boolean                                  extensionSession               o
++end
++
++
++object VAppConfigSpec extends VmConfigSpec
++    String                                   annotation                     o
++    VAppEntityConfigInfo                     entityConfig                   ol
++end
++
++object VAppEntityConfigInfo
++    Boolean                                  destroyWithParent              o
++    ManagedObjectReference                   key                            o
++    String                                   startAction                    o
++    Int                                      startDelay                     o
++    Int                                      startOrder                     o
++    String                                   stopAction                     o
++    Int                                      stopDelay                      o
++    String                                   tag                            o
++    Boolean                                  waitingForGuest                o
++end
++
++
++object VAppIPAssignmentInfo
++    String                                   ipAllocationPolicy             o
++    String                                   ipProtocol                     o
++    String                                   supportedAllocationScheme      ol
++    String                                    supportedIpProtocol           ol
++end
++
++
++object VAppOvfSectionInfo
++   Boolean                                   atEnvelopeLevel                o
++   String                                    contents                       o
++   Int                                       key                            o
++   String                                    namespace                      o
++   String                                    type                           o
++end
++
++
++object VAppOvfSectionSpec extends ArrayUpdateSpec
++   VAppOvfSectionInfo                        info                           o
++end
++
++
++object VAppProductInfo
++    String                                   appUrl                         o
++    String                                   classId                        o
++    String                                   fullVersion                    o
++    String                                   instanceId                     o
++    Int                                      key                            r
++    String                                   name                           o
++    String                                   productUrl                     o
++    String                                   vendor                         o
++    String                                   vendorUrl                      o
++    String                                   version                        o
++end
++
++
++object VAppProductSpec extends ArrayUpdateSpec
++   VAppProductInfo                           info                           o
++end
++
++
++object VAppPropertyInfo
++    String                                   category                       o
++    String                                   classId                        o
++    String                                   defaultValue                   o
++    String                                   description                    o
++    String                                   id                             o
++    Int                                      key                            r
++    String                                   label                          o
++    String                                   type                           o
++    Boolean                                  userConfigurable               o
++    String                                   value                          o
++end
++
++
++object VAppPropertySpec extends ArrayUpdateSpec
++    VAppPropertyInfo                         info                           o
++end
++
++
++object VirtualDevice
++    Int                                      key                            r
++    Description                              deviceInfo                     o
++    VirtualDeviceBackingInfo                 backing                        o
++    VirtualDeviceConnectInfo                 connectable                    o
++    Int                                      controllerKey                  o
++    Int                                      unitNumber                     o
++end
++
++
++object VirtualDeviceBackingInfo
++end
++
++
++object VirtualDeviceConnectInfo
++    Boolean                                  startConnected                 r
++    Boolean                                  allowGuestControl              r
++    Boolean                                  connected                      r
++    String                                   status                         o
++end
++
++
++object VirtualCdrom extends VirtualDevice
++end
++
++
++object VirtualController extends VirtualDevice
++    Int                                      busNumber                      r
++    Int                                      device                         ol
++end
++
++
++object VirtualIDEController extends VirtualController
++end
++
++
++object VirtualPCIController extends VirtualController
++end
++
++
++object VirtualPS2Controller extends VirtualController
++end
++
++
++object VirtualSCSIController extends VirtualController
++    Boolean                                  hotAddRemove                   o
++    Int                                      scsiCtlrUnitNumber             o
++    VirtualSCSISharing                       sharedBus                      r
++end
++
++
++object ParaVirtualSCSIController extends VirtualSCSIController
++end
++
++
++object VirtualBusLogicController extends VirtualSCSIController
++end
++
++
++object VirtualLsiLogicController extends VirtualSCSIController
++end
++
++
++object VirtualLsiLogicSASController extends VirtualSCSIController
++end
++
++
++object VirtualSIOController extends VirtualController
++end
++
++
++object VirtualUSBController extends VirtualController
++    Boolean                                  autoConnectDevices             o
++    Boolean                                  ehciEnabled                    o
++end
++
++
++object VirtualDeviceConfigSpec
++    VirtualDeviceConfigSpecOperation         operation                      o
++    VirtualDeviceConfigSpecFileOperation     fileOperation                  o
++    VirtualDevice                            device                         r
++end
++
++
++object VirtualDisk extends VirtualDevice
++    Long                                     capacityInKB                   r
++    SharesInfo                               shares                         o
+ end
+ 
+ 
+@@ -1082,6 +1518,283 @@ object VirtualDiskSpec
+ end
+ 
+ 
++object VirtualEthernetCard extends VirtualDevice
++    String                                   addressType                    o
++    String                                   macAddress                     o
++    Boolean                                  wakeOnLanEnabled               o
++end
++
++
++object VirtualE1000 extends VirtualEthernetCard
++end
++
++
++object VirtualPCNet32 extends VirtualEthernetCard
++end
++
++
++object VirtualVmxnet extends VirtualEthernetCard
++end
++
++
++object VirtualVmxnet2 extends VirtualVmxnet
++end
++
++
++object VirtualVmxnet3 extends VirtualVmxnet
++end
++
++
++object VirtualFloppy extends VirtualDevice
++end
++
++
++object VirtualKeyboard extends VirtualDevice
++end
++
++
++object VirtualMachineCpuIdInfoSpec
++    HostCpuIdInfo                            info                           o
++end
++
++
++object VirtualMachineVideoCard extends VirtualDevice
++    Boolean                                  enable3DSupport                o
++    Int                                      numDisplays                    o
++    Boolean                                  useAutoDetect                  o
++    Long                                     videoRamSizeInKB               o
++end
++
++
++object VirtualMachineVMCIDevice extends VirtualDevice
++    Boolean                                  allowUnrestrictedCommunication o
++    Long                                     id                             o
++end
++
++
++object VirtualMachineVMIROM extends VirtualDevice
++end
++
++
++object VirtualParallelPort extends VirtualDevice
++end
++
++
++object VirtualPCIPassthrough extends VirtualDevice
++end
++
++
++object VirtualPointingDevice extends VirtualDevice
++end
++
++
++object VirtualSCSIPassthrough extends VirtualDevice
++end
++
++
++object VirtualSerialPort extends VirtualDevice
++    Boolean                                  yieldOnPoll                    r
++end
++
++object VirtualSoundCard extends VirtualDevice
++end
++
++object VirtualUSB extends VirtualDevice
++    Boolean                                  connected                      r
++end
++
++
++object VirtualDeviceBackingInfo
++end
++
++
++object VirtualDeviceDeviceBackingInfo extends VirtualDeviceBackingInfo
++    String                                   deviceName                     r
++    Boolean                                  useAutoDetect                  o
++end
++
++
++object VirtualCdromAtapiBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualCdromPassthroughBackingInfo extends VirtualDeviceDeviceBackingInfo
++    Boolean                                  exclusive                      r
++end
++
++
++object VirtualDiskRawDiskVer2BackingInfo extends VirtualDeviceDeviceBackingInfo
++    String                                   changeId                       o
++    String                                   descriptorFileName             r
++    String                                   uuid                           o
++end
++
++
++object VirtualDiskPartitionedRawDiskVer2BackingInfo extends VirtualDiskRawDiskVer2BackingInfo
++    Int                                      partition                      rl
++end
++
++
++object VirtualEthernetCardLegacyNetworkBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualEthernetCardNetworkBackingInfo extends VirtualDeviceDeviceBackingInfo
++    Boolean                                  inPassthroughMode              o
++    ManagedObjectReference                   network                        o
++end
++
++
++object VirtualFloppyDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualParallelPortDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualPCIPassthroughDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++    String                                   deviceId                       r
++    String                                   id                             r
++    String                                   systemId                       r
++    Int                                      vendorId                       r
++end
++
++
++object VirtualPointingDeviceDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++    String                                   hostPointingDevice             r
++end
++
++
++object VirtualSCSIPassthroughDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualSerialPortDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualSoundCardDeviceBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualUSBUSBBackingInfo extends VirtualDeviceDeviceBackingInfo
++end
++
++
++object VirtualDeviceFileBackingInfo extends VirtualDeviceBackingInfo
++    String                                   fileName                       r
++    ManagedObjectReference                   datastore                      o
++end
++
++
++object VirtualCdromIsoBackingInfo extends VirtualDeviceFileBackingInfo
++end
++
++
++object VirtualDiskFlatVer1BackingInfo extends VirtualDeviceFileBackingInfo
++    String                                   contentId                      o
++    String                                   diskMode                       r
++    VirtualDiskFlatVer1BackingInfo           parent                         o
++    Boolean                                  split                          o
++    Boolean                                  writeThrough                   o
++end
++
++
++object VirtualDiskFlatVer2BackingInfo extends VirtualDeviceFileBackingInfo
++    String                                   changeId                       o
++    String                                   contentId                      o
++    String                                   diskMode                       r
++    VirtualDiskFlatVer2BackingInfo           parent                         o
++    Boolean                                  split                          o
++    Boolean                                  thinProvisioned                o
++    Boolean                                  eagerlyScrub                   o
++    String                                   uuid                           o
++    Boolean                                  writeThrough                   o
++end
++
++
++object VirtualDiskRawDiskMappingVer1BackingInfo extends VirtualDeviceFileBackingInfo
++    String                                   changeId                       o
++    String                                   compatibilityMode              o
++    String                                   contentId                      o
++    String                                   deviceName                     o
++    String                                   diskMode                       o
++    String                                   lunUuid                        o
++    VirtualDiskRawDiskMappingVer1BackingInfo parent                         o
++    String                                   uuid                           o
++end
++
++
++object VirtualDiskSparseVer1BackingInfo extends VirtualDeviceFileBackingInfo
++    String                                   contentId                      o
++    String                                   diskMode                       r
++    VirtualDiskSparseVer1BackingInfo         parent                         o
++    Long                                     spaceUsedInKB                  o
++    Boolean                                  split                          o
++    Boolean                                  writeThrough                   o
++end
++
++
++object VirtualDiskSparseVer2BackingInfo extends VirtualDeviceFileBackingInfo
++    String                                   changeId                       o
++    String                                   contentId                      o
++    String                                   diskMode                       r
++    VirtualDiskSparseVer2BackingInfo         parent                         o
++    Long                                     spaceUsedInKB                  o
++    Boolean                                  split                          o
++    String                                   uuid                           o
++    Boolean                                  writeThrough                   o
++end
++
++
++object VirtualFloppyImageBackingInfo extends VirtualDeviceFileBackingInfo
++end
++
++
++object VirtualParallelPortFileBackingInfo extends VirtualDeviceFileBackingInfo
++end
++
++
++object VirtualSerialPortFileBackingInfo extends VirtualDeviceFileBackingInfo
++end
++
++
++object VirtualDevicePipeBackingInfo extends VirtualDeviceBackingInfo
++    String                                   pipeName                       r
++end
++
++
++object VirtualSerialPortPipeBackingInfo extends VirtualDevicePipeBackingInfo
++    String                                   endpoint                       r
++    Boolean                                  noRxLoss                       o
++end
++
++
++object VirtualDeviceRemoteDeviceBackingInfo extends VirtualDeviceBackingInfo
++    String                                   deviceName                     r
++    Boolean                                  useAutoDetect                  o
++end
++
++
++object VirtualCdromRemoteAtapiBackingInfo extends VirtualDeviceRemoteDeviceBackingInfo
++end
++
++
++object VirtualCdromRemotePassthroughBackingInfo extends VirtualDeviceRemoteDeviceBackingInfo
++    Boolean                                  exclusive                      r
++end
++
++
++object VirtualFloppyRemoteDeviceBackingInfo extends VirtualDeviceRemoteDeviceBackingInfo
++end
++
++
++object VirtualMachineAffinityInfo
++    Int                                      affinitySet                    ol
++end
++
++
+ object VirtualMachineConfigSpec
+     String                                   changeVersion                  o
+     String                                   name                           o
+@@ -1100,33 +1813,93 @@ object VirtualMachineConfigSpec
+     String                                   guestId                        o
+     String                                   alternateGuestName             o
+     String                                   annotation                     o
+-    VirtualMachineFileInfo                   files                          i
+-    ToolsConfigInfo                          tools                          i
+-    VirtualMachineFlagInfo                   flags                          i
+-    VirtualMachineConsolePreferences         consolePreferences             i
+-    VirtualMachineDefaultPowerOpInfo         powerOpInfo                    i
++    VirtualMachineFileInfo                   files                          o
++    ToolsConfigInfo                          tools                          o
++    VirtualMachineFlagInfo                   flags                          o
++    VirtualMachineConsolePreferences         consolePreferences             o
++    VirtualMachineDefaultPowerOpInfo         powerOpInfo                    o
+     Int                                      numCPUs                        o
++    Int                                      numCoresPerSocket              o
+     Long                                     memoryMB                       o
+     Boolean                                  memoryHotAddEnabled            o
+     Boolean                                  cpuHotAddEnabled               o
+     Boolean                                  cpuHotRemoveEnabled            o
+-    VirtualDeviceConfigSpec                  deviceChange                   i
++    VirtualDeviceConfigSpec                  deviceChange                   ol
+     ResourceAllocationInfo                   cpuAllocation                  o
+     ResourceAllocationInfo                   memoryAllocation               o
+-    VirtualMachineAffinityInfo               cpuAffinity                    i
+-    VirtualMachineAffinityInfo               memoryAffinity                 i
+-    VirtualMachineNetworkShaperInfo          networkShaper                  i
+-    VirtualMachineCpuIdInfoSpec              cpuFeatureMask                 i
+-    OptionValue                              extraConfig                    i
++    VirtualMachineAffinityInfo               cpuAffinity                    o
++    VirtualMachineAffinityInfo               memoryAffinity                 o
++    VirtualMachineNetworkShaperInfo          networkShaper                  o
++    VirtualMachineCpuIdInfoSpec              cpuFeatureMask                 o
++    OptionValue                              extraConfig                    ol
+     String                                   swapPlacement                  o
+-    VirtualMachineBootOptions                bootOptions                    i
+-    VmConfigSpec                             vAppConfig                     i
++    VirtualMachineBootOptions                bootOptions                    o
++    VmConfigSpec                             vAppConfig                     o
+     FaultToleranceConfigInfo                 ftInfo                         i
+     Boolean                                  vAppConfigRemoved              o
+     Boolean                                  vAssertsEnabled                o
+     Boolean                                  changeTrackingEnabled          o
+ end
+ 
++object VirtualMachineDefaultPowerOpInfo
++    String                                   defaultPowerOffType            o
++    String                                   defaultResetType               o
++    String                                   defaultSuspendType             o
++    String                                   powerOffType                   o
++    String                                   resetType                      o
++    String                                   standbyAction                  o
++    String                                   suspendType                    o
++end
++
++object VirtualMachineConsolePreferences
++    Boolean                                  closeOnPowerOffOrSuspend       o
++    Boolean                                  enterFullScreenOnPowerOn       o
++    Boolean                                  powerOnWhenOpened              o
++end
++
++object VirtualMachineFileInfo
++    String                                   logDrirectory                  o
++    String                                   snapshotDirectory              o
++    String                                   suspendDirectory               o
++    String                                   vmPathName                     o
++end
++
++
++object VirtualMachineNetworkShaperInfo
++    Long                                    averageBps                      o
++    Long                                    burstSize                       o
++    Boolean                                 enabled                         o
++    Long                                    peakBps                         o
++end
++
++object VirtualMachineFlagInfo
++    Boolean                                  disableAcceleration            o
++    Boolean                                  diskUuidEnabled                o
++    Boolean                                  enableLogging                  o
++    String                                   htSharing                      o
++    String                                   monitorType                    o
++    Boolean                                  recordReplayEnabled            o
++    Boolean                                  runWithDebugInfo               o
++    Boolean                                  snapshotDisabled               o
++    Boolean                                  snapshotLocked                 o
++    String                                   snapshotPowerOffBehavior       o
++    Boolean                                  useToe                         o
++    String                                   virtualExecUsage               o
++    String                                   virtualMmuUsage                o
++end
++
++object VirtualMachineBootOptions
++    Long                                     bootDelay                      o
++    Long                                     bootRetryDelay                 o
++    Boolean                                  bootRetryEnabled               o
++    Boolean                                  enterBIOSSetup                 o
++end
++
++object VirtualMachineImportSpec extends ImportSpec
++    VirtualMachineConfigSpec                 configSpec                     r
++    ManagedObjectReference                   resPoolEntity                  o
++end
++
+ 
+ object VirtualMachineQuestionInfo
+     String                                   id                             r
+@@ -1172,6 +1945,18 @@ object VmConfigFileQueryFlags
+ end
+ 
+ 
++object VmConfigSpec
++    Boolean                                  installBootRequired            o
++    Int                                      installBootStopDelay           o
++    String                                   eula                           ol
++    VAppIPAssignmentInfo                     ipAssignment                   o
++    String                                   ovfEnviornmentTransport        ol
++    VAppOvfSectionSpec                       ovfSection                     ol
++    VAppProductSpec                          product                        ol
++    VAppPropertySpec                         property                       ol
++end
++
++
+ object VmDiskFileInfo                extends FileInfo
+     String                                   diskType                       o
+     Long                                     capacityKb                     o
+@@ -1310,6 +2095,15 @@ method CopyVirtualDisk_Task          returns ManagedObjectReference         r
+ end
+ 
+ 
++method CreateImportSpec returns OvfCreateImportSpecResult r
++    ManagedObjectReference                   _this                          r
++    String                                   ovfDescriptor                  r
++    ManagedObjectReference                   resourcePool                   r
++    ManagedObjectReference                   datastore                      r
++    OvfCreateImportSpecParams                cisp                           r
++end
++
++
+ method CreateFilter                  returns ManagedObjectReference         r
+     ManagedObjectReference                   _this:propertyCollector        r
+     PropertyFilterSpec                       spec                           r
+@@ -1363,12 +2157,35 @@ method FindByUuid                    returns ManagedObjectReference         o
+ end
+ 
+ 
++method HttpNfcLeaseAbort
++    ManagedObjectReference                  _this                           r
++end
++
++
++method HttpNfcLeaseComplete
++    ManagedObjectReference                  _this                           r
++end
++
++
++method HttpNfcLeaseGetManifest returns HttpNfcLeaseManifestEntry rl
++    ManagedObjectReference                  _this                           r
++end
++
++
+ method HttpNfcLeaseProgress
+     ManagedObjectReference                  _this                           r
+     Int                                     percent                         r
+ end
+ 
+ 
++method ImportVApp returns ManagedObjectReference r
++    ManagedObjectReference                  _this                           r
++    VirtualMachineImportSpec                spec                            r
++    ManagedObjectReference                  folder                          o
++    ManagedObjectReference                  host                            o
++end
++
++
+ method Login                         returns UserSession                    r
+     ManagedObjectReference                   _this:sessionManager           r
+     String                                   userName                       r
+@@ -1404,6 +2221,13 @@ method PowerOffVM_Task               returns ManagedObjectReference         r
+ end
+ 
+ 
++method ParseDescriptor returns OvfParseDescriptorResult r
++    ManagedObjectReference                   _this                          r
++    String                                   ovfDescriptor                  r
++    OvfParseDescriptorParams                 pdp                            r
++end
++
++
+ method PowerOnVM_Task                returns ManagedObjectReference         r
+     ManagedObjectReference                   _this                          r
+     ManagedObjectReference                   host                           o
+diff --git a/src/esx/esx_vi_generator.py b/src/esx/esx_vi_generator.py
+index af4e7e8..19f4ffe 100755
+--- a/src/esx/esx_vi_generator.py
++++ b/src/esx/esx_vi_generator.py
+@@ -1284,7 +1284,6 @@ class ManagedObject(Type):
+         return source
+ 
+ 
+-
+ class Enum(Type):
+     FEATURE__ANY_TYPE = (1 << 1)
+     FEATURE__SERIALIZE = (1 << 2)
+@@ -1518,7 +1517,8 @@ predefined_objects = ["AnyType",
+ 
+ additional_enum_features = { "ManagedEntityStatus"      : Enum.FEATURE__ANY_TYPE,
+                              "TaskInfoState"            : Enum.FEATURE__ANY_TYPE,
+-                             "VirtualMachinePowerState" : Enum.FEATURE__ANY_TYPE }
++                             "VirtualMachinePowerState" : Enum.FEATURE__ANY_TYPE,
++                             "VirtualMachineToolsStatus" : Enum.FEATURE__ANY_TYPE }
+ 
+ additional_object_features = { "AutoStartDefaults"          : Object.FEATURE__ANY_TYPE,
+                                "AutoStartPowerInfo"         : Object.FEATURE__ANY_TYPE,
+@@ -1527,6 +1527,7 @@ additional_object_features = { "AutoStartDefaults"          : Object.FEATURE__AN
+                                                               Object.FEATURE__ANY_TYPE,
+                                "DatastoreInfo"              : Object.FEATURE__ANY_TYPE |
+                                                               Object.FEATURE__DYNAMIC_CAST,
++                               "DynamicProperty"            : Object.FEATURE__LIST,
+                                "HostConfigManager"          : Object.FEATURE__ANY_TYPE,
+                                "HostCpuIdInfo"              : Object.FEATURE__LIST |
+                                                               Object.FEATURE__ANY_TYPE,
+@@ -1552,8 +1553,12 @@ additional_object_features = { "AutoStartDefaults"          : Object.FEATURE__AN
+                                "HostVirtualSwitch"          : Object.FEATURE__DEEP_COPY |
+                                                               Object.FEATURE__LIST |
+                                                               Object.FEATURE__ANY_TYPE,
++                               "HttpNfcLeaseInfo"           : Object.FEATURE__ANY_TYPE,
+                                "ManagedObjectReference"     : Object.FEATURE__ANY_TYPE,
+                                "ObjectContent"              : Object.FEATURE__DEEP_COPY,
++                               "OptionDef"                  : Object.FEATURE__LIST,
++                               "OptionValue"                : Object.FEATURE__ANY_TYPE |
++                                                              Object.FEATURE__LIST,
+                                "PhysicalNic"                : Object.FEATURE__DEEP_COPY |
+                                                               Object.FEATURE__LIST |
+                                                               Object.FEATURE__ANY_TYPE,
+@@ -1567,9 +1572,13 @@ additional_object_features = { "AutoStartDefaults"          : Object.FEATURE__AN
+                                "TaskInfo"                   : Object.FEATURE__LIST |
+                                                               Object.FEATURE__ANY_TYPE,
+                                "UserSession"                : Object.FEATURE__ANY_TYPE,
++                               "VirtualDeviceConfigSpec"    : Object.FEATURE__LIST,
++                               "VirtualMachineImportSpec"   : Object.FEATURE__DYNAMIC_CAST,
+                                "VirtualMachineQuestionInfo" : Object.FEATURE__ANY_TYPE,
+                                "VirtualMachineSnapshotTree" : Object.FEATURE__DEEP_COPY |
+                                                               Object.FEATURE__ANY_TYPE,
++                               "VirtualDevice"              : Object.FEATURE__ANY_TYPE |
++                                                              Object.FEATURE__LIST,
+                                "VmEventArgument"            : Object.FEATURE__DESERIALIZE }
+ 
+ removed_object_features = {}
+diff --git a/src/esx/esx_vi_types.c b/src/esx/esx_vi_types.c
+index d1f91ff..c1c314c 100644
+--- a/src/esx/esx_vi_types.c
++++ b/src/esx/esx_vi_types.c
+@@ -720,14 +720,15 @@ esxVI_GetActualObjectType(xmlNodePtr node, esxVI_Type baseType,
+                       BAD_CAST "http://www.w3.org/2001/XMLSchema-instance");
+ 
+     if (type == NULL) {
+-        virReportError(VIR_ERR_INTERNAL_ERROR,
+-                       _("%s is missing 'type' property"),
+-                       esxVI_Type_ToString(baseType));
+-        return -1;
++        /**
++         * Few ESX objects are nasty and doesn't contain any 'type' value,
++         * for instance: VmConfigSpec; set the value to baseType and proceed
++         */
++        *actualType = baseType;
++    } else {
++        *actualType = esxVI_Type_FromString(type);
+     }
+ 
+-    *actualType = esxVI_Type_FromString(type);
+-
+     if (*actualType == esxVI_Type_Undefined || *actualType == esxVI_Type_Other) {
+         virReportError(VIR_ERR_INTERNAL_ERROR,
+                        _("Unknown value '%s' for %s 'type' property"),
+-- 
+1.7.9.5
+
