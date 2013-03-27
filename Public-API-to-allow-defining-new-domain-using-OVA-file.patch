@@ -1,0 +1,130 @@
+diff --git a/include/libvirt/libvirt.h.in b/include/libvirt/libvirt.h.in
+index 09c89c5..ea342bc 100644
+--- a/include/libvirt/libvirt.h.in
++++ b/include/libvirt/libvirt.h.in
+@@ -1919,6 +1919,9 @@ int                     virDomainMemoryPeek (virDomainPtr dom,
+  */
+ virDomainPtr            virDomainDefineXML      (virConnectPtr conn,
+                                                  const char *xml);
++virDomainPtr            virDomainDefineOVA      (virConnectPtr conn,
++                                                 const char *ovapath,
++                                                 const char *poolname);
+ int                     virDomainUndefine       (virDomainPtr domain);
+ 
+ typedef enum {
+diff --git a/src/driver.h b/src/driver.h
+index 01c95cf..08382a0 100644
+--- a/src/driver.h
++++ b/src/driver.h
+@@ -274,6 +274,10 @@ typedef int
+ typedef virDomainPtr
+         (*virDrvDomainDefineXML)        (virConnectPtr conn,
+                                          const char *xml);
++typedef virDomainPtr
++        (*virDrvDomainDefineOVA)        (virConnectPtr conn,
++                                         const char *ovapath,
++                                         const char *poolname);
+ typedef int
+         (*virDrvDomainUndefine)         (virDomainPtr dom);
+ typedef int
+@@ -1008,6 +1012,7 @@ struct _virDriver {
+     virDrvDomainCreate                  domainCreate;
+     virDrvDomainCreateWithFlags         domainCreateWithFlags;
+     virDrvDomainDefineXML               domainDefineXML;
++    virDrvDomainDefineOVA               domainDefineOVA;
+     virDrvDomainUndefine                domainUndefine;
+     virDrvDomainUndefineFlags           domainUndefineFlags;
+     virDrvDomainAttachDevice            domainAttachDevice;
+diff --git a/src/libvirt.c b/src/libvirt.c
+index 6d1da12..bdc21b4 100644
+--- a/src/libvirt.c
++++ b/src/libvirt.c
+@@ -1988,6 +1988,8 @@ error:
+     return NULL;
+ }
+ 
++
++
+ /**
+  * virDomainCreateLinux:
+  * @conn: pointer to the hypervisor connection
+@@ -8334,6 +8336,62 @@ error:
+ }
+ 
+ /**
++ * virDomainDefineOVA:
++ * @conn: pointer to the hypervisor connection
++ * @ovapath: OVA file path
++ * @poolname: storage pool where domain needs to be created
++ *
++ * OVA stands for Open Virtualuzation Archive and consist of
++ * three important components:
++ * 1. XML descriptor: defines the virtual machine hardware description,
++ *                    network connectivity etc.
++ * 2. Virtual disk (may be compressed or optimized).
++ * 3. Manifest file.
++ *
++ * Define a new domain but does not start it.
++ * This function may require privileged access to the hypervisor.
++ *
++ * Returns a new domain object or NULL in case of failure
++ */
++virDomainPtr
++virDomainDefineOVA(virConnectPtr conn, const char *ovapath,
++                   const char *poolname)
++{
++    VIR_DEBUG("conn=%p, ovaPath=%s, poolname=%s",
++      conn, ovapath, poolname);
++
++    virResetLastError();
++
++    if (!VIR_IS_CONNECT(conn)) {
++        virLibConnError(VIR_ERR_INVALID_CONN, __FUNCTION__);
++        virDispatchError(NULL);
++        return NULL;
++    }
++    if (conn->flags & VIR_CONNECT_RO) {
++        virLibConnError(VIR_ERR_OPERATION_DENIED, __FUNCTION__);
++        goto error;
++    }
++    virCheckNonNullArgGoto(ovapath, error);
++    virCheckNonNullArgGoto(poolname, error);
++
++    if (conn->driver->domainDefineOVA) {
++        virDomainPtr ret;
++        ret = conn->driver->domainDefineOVA(
++                        conn, ovapath, poolname);
++        if (!ret)
++            goto error;
++        return ret;
++    }
++
++    virLibConnError(VIR_ERR_NO_SUPPORT, __FUNCTION__);
++
++error:
++    virDispatchError(conn);
++    return NULL;
++
++}
++
++/**
+  * virDomainCreate:
+  * @domain: pointer to a defined domain
+  *
+diff --git a/src/libvirt_public.syms b/src/libvirt_public.syms
+index 2107519..1af48c9 100644
+--- a/src/libvirt_public.syms
++++ b/src/libvirt_public.syms
+@@ -585,4 +585,9 @@ LIBVIRT_1.0.2 {
+         virDomainOpenChannel;
+ } LIBVIRT_1.0.1;
+ 
++LIBVIRT_1.0.3 {
++    global:
++        virDomainDefineOVA;
++} LIBVIRT_1.0.2;
++
+ # .... define new API here using predicted next version number ....
+-- 
+1.7.9.5
+
